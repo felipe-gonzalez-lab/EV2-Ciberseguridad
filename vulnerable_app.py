@@ -1,8 +1,11 @@
+
 from flask import Flask, request, render_template_string, session, redirect, url_for
 import sqlite3
 import os
 import hashlib
 import hmac # para inyeccion sql. Usar como password: cualquiercosa' OR '1'='1 
+import secrets
+import time
 
 # ---- Sanitización robusta (Bleach con fallback) ----
 try:
@@ -36,6 +39,7 @@ app = Flask(__name__)
 # En producción usa una clave fija por entorno
 app.secret_key = os.urandom(24)
 
+# ---------- DB helpers ----------
 def get_db_connection():
     conn = sqlite3.connect('database.db')
     conn.row_factory = sqlite3.Row
@@ -83,6 +87,56 @@ else:
         return resp
 # -----------------------------------------------
 
+# ---------- MFA helpers ----------
+MFA_TTL_SECONDS = 300  # 5 minutos
+MFA_MAX_ATTEMPTS = 5 # 5 intentos
+
+def _require_auth_and_mfa():
+    """Pequeña ayuda reusable en rutas protegidas."""
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
+    # Si aún no pasó MFA, redirigir
+    if not session.get('mfa_ok'):
+        return redirect(url_for('mfa'))
+    return None
+
+def _start_mfa_for(user_id: int, username: str):
+    """Genera un código 2FA, lo deja en sesión (hash + exp) y lo imprime en consola."""
+    # Código de 6 dígitos
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    code_hash = hashlib.sha256(code.encode()).hexdigest()
+    now = int(time.time())
+    session['pending_mfa'] = {
+        'user_id': user_id,
+        'username': username,
+        'code_hash': code_hash,
+        'exp': now + MFA_TTL_SECONDS,
+        'attempts': 0
+    }
+    session['mfa_ok'] = False
+    # IMPORTANTE: entregar el código por consola/terminal (logs del servidor)
+    print(f"[MFA] Código para usuario '{username}' (id={user_id}): {code}  (válido por {MFA_TTL_SECONDS//60} min)" )
+
+def _verify_mfa(submitted_code: str) -> bool:
+    data = session.get('pending_mfa')
+    if not data:
+        return False
+    # Expiración
+    if int(time.time()) > int(data.get('exp', 0)):
+        return False
+    # Intentos
+    attempts = int(data.get('attempts', 0)) + 1
+    data['attempts'] = attempts
+    session['pending_mfa'] = data  # persistir incremento
+    if attempts > MFA_MAX_ATTEMPTS:
+        return False
+    submitted_hash = hashlib.sha256((submitted_code or '').encode()).hexdigest()
+    return hmac.compare_digest(submitted_hash, data.get('code_hash', ''))
+
+def _clear_mfa_state():
+    session.pop('pending_mfa', None)
+
+# ---------- Rutas ----------
 @app.route('/')
 def index():
     return 'Welcome to the Task Manager Application!'
@@ -90,7 +144,7 @@ def index():
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'POST':
-        username = request.form.get('username', '')
+        username = request.form.get('username', '').strip()
         password = request.form.get('password', '')
 
         conn = get_db_connection()
@@ -105,24 +159,88 @@ def login():
         if row:
             submitted_hash = hash_password(password)
             if hmac.compare_digest(row['password'], submitted_hash):
-                session['user_id'] = row['id']
-                session['role'] = row['role']
-                return redirect(url_for('dashboard'))
-
+                # Paso 1 OK -> iniciar MFA
+                session.clear()  # limpiar sesión previa
+                session['preauth_user'] = {'id': row['id'], 'role': row['role'], 'username': username}
+                _start_mfa_for(row['id'], username)
+                return redirect(url_for('mfa'))
         return 'Invalid credentials!'
 
     return '''
-        <form method="post">
-            Username: <input type="text" name="username"><br>
-            Password: <input type="password" name="password"><br>
+        <form method="post" autocomplete="off">
+            <label>Username: <input type="text" name="username" required></label><br>
+            <label>Password: <input type="password" name="password" required></label><br>
             <input type="submit" value="Login">
         </form>
     '''
 
+@app.route('/mfa', methods=['GET', 'POST'])
+def mfa():
+    # Si ya autenticó MFA, ir al dashboard
+    if session.get('mfa_ok') and session.get('user_id'):
+        return redirect(url_for('dashboard'))
+
+    # Debe existir un preauth válido
+    pre = session.get('preauth_user')
+    pending = session.get('pending_mfa')
+    if not pre or not pending:
+        return redirect(url_for('login'))
+
+    error_msg = ''
+    locked = False
+
+    if request.method == 'POST':
+        code = request.form.get('code', '').strip()
+        # Validar intentos/expiración antes de comparar
+        if int(time.time()) > int(pending.get('exp', 0)):
+            error_msg = 'El código ha expirado. Inicia sesión nuevamente.'
+            session.clear()
+            return render_template_string(MFA_TEMPLATE, error_msg=error_msg)
+
+        if int(pending.get('attempts', 0)) >= MFA_MAX_ATTEMPTS:
+            locked = True
+        else:
+            if _verify_mfa(code):
+                # MFA OK -> promover a sesión autenticada
+                session['user_id'] = pre['id']
+                session['role'] = pre['role']
+                session['mfa_ok'] = True
+                # limpiar datos temporales
+                session.pop('preauth_user', None)
+                _clear_mfa_state()
+                return redirect(url_for('dashboard'))
+            else:
+                error_msg = 'Código incorrecto.'
+                # actualizar pending para reflejar los intentos
+                pending = session.get('pending_mfa', {})
+                if int(pending.get('attempts', 0)) >= MFA_MAX_ATTEMPTS:
+                    locked = True
+
+    return render_template_string(MFA_TEMPLATE, error_msg=error_msg, locked=locked)
+
+MFA_TEMPLATE = '''
+{% autoescape true %}
+<h1>Verificación en dos pasos</h1>
+<p>Hemos enviado un código de verificación a la <strong>consola del servidor</strong>. Ingresa el código para continuar.</p>
+{% if error_msg %}<p style="color:red">{{ error_msg }}</p>{% endif %}
+{% if locked %}
+  <p style="color:red">Demasiados intentos fallidos. Vuelve a iniciar sesión.</p>
+  <a href="{{ url_for('login') }}">Volver al login</a>
+{% else %}
+  <form method="post" autocomplete="off">
+      <label>Código MFA: <input type="text" name="code" inputmode="numeric" pattern="\d{6}" maxlength="6" required></label><br>
+      <input type="submit" value="Verificar">
+  </form>
+  <p><small>El código expira en 5 minutos.</small></p>
+{% endif %}
+{% endautoescape %}
+'''
+
 @app.route('/dashboard')
 def dashboard():
-    if 'user_id' not in session:
-        return redirect(url_for('login'))
+    redir = _require_auth_and_mfa()
+    if redir:
+        return redir
 
     user_id = session['user_id']
     conn = get_db_connection()
@@ -139,7 +257,7 @@ def dashboard():
         {% autoescape true %}
         <h1>Welcome, user {{ user_id }}!</h1>
         <form action="{{ url_for('add_task') }}" method="post" autocomplete="off">
-            <input type="text" name="task" placeholder="New task" maxlength="500"><br>
+            <input type="text" name="task" placeholder="New task" maxlength="500" required><br>
             <input type="submit" value="Add Task">
         </form>
         <h2>Your Tasks</h2>
@@ -157,8 +275,9 @@ def dashboard():
 
 @app.route('/add_task', methods=['POST'])
 def add_task():
-    if 'user_id' not in session:
-        return redirect(url_for('login'))
+    redir = _require_auth_and_mfa()
+    if redir:
+        return redir
 
     raw_task = request.form.get('task', '')
     # Sanitizamos EN LA ENTRADA para prevenir XSS almacenado
@@ -184,8 +303,9 @@ def add_task():
 
 @app.route('/delete_task/<int:task_id>')
 def delete_task(task_id):
-    if 'user_id' not in session:
-        return redirect(url_for('login'))
+    redir = _require_auth_and_mfa()
+    if redir:
+        return redir
 
     conn = get_db_connection()
     try:
@@ -198,10 +318,19 @@ def delete_task(task_id):
 
 @app.route('/admin')
 def admin():
-    if 'user_id' not in session or session.get('role') != 'admin':
-        return redirect(url_for('login'))
+    redir = _require_auth_and_mfa()
+    if redir:
+        return redir
+
+    if session.get('role') != 'admin':
+        return redirect(url_for('dashboard'))
 
     return 'Welcome to the admin panel!'
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    return redirect(url_for('login'))
 
 if __name__ == '__main__':
     # En producción, desactiva debug
